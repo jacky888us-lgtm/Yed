@@ -1,0 +1,1566 @@
+--[[
+	FruitFinder.lua -- Blox Fruits fruit finder (Luau, executor script)
+
+	v2: deteksi buah ditulis ulang supaya tidak lagi "kadang terbaca kadang tidak".
+	  - Memantau SEMUA keturunan Workspace (bukan hanya anak langsung) lewat DescendantAdded.
+	  - Rescan cepat (anak Workspace, tiap 1s) + rescan dalam (semua keturunan, tiap 8s, dipecah per chunk).
+	  - Buah yang namanya berubah setelah di-parent, atau Handle yang telat muncul, dicoba ulang (Pending/Watch).
+	  - Cocok berdasarkan kata "Fruit" ATAU nama buah dari daftar KnownNames (Rocket sampai Dragon, Magnet, dst).
+	  - Buah yang dipegang karakter/NPC tidak dihitung.
+
+	v2.1: tombol Auto-grab -- ambil buah dari jarak berapa pun (touch jarak jauh, fallback snap sesaat), lalu equip.
+
+	v2.2: teleport instan ke posisi buah (tombol TP per baris, TP Terdekat, Auto-TP) tanpa terbang.
+	  Satu lompatan CFrame + pin singkat, lalu hasilnya diverifikasi (buah hilang / posisi ditarik balik server).
+
+	Fitur lama tetap: ESP, daftar menu, fly-to-fruit (manual/terdekat/auto), cleanup saat re-run/close.
+
+	Item bertanda ASSUMPTION / UNKNOWN belum diverifikasi di build asli -- pakai tombol Probe.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+	task.wait()
+	LocalPlayer = Players.LocalPlayer
+end
+
+----------------------------------------------------------------------
+-- Config (single place for every game-dependent value)
+----------------------------------------------------------------------
+local Config = {
+	Fruit = {
+		-- Kandidat = Tool (atau Model yang punya part "Handle") di bawah SearchRoots, yang TIDAK
+		-- dipegang karakter/NPC.
+		--   Tool  : diterima jika namanya memuat NameKeyword ATAU salah satu nama buah
+		--           (KnownNames / LegacyAliases / ExtraNames), cocok per kata, tanpa peduli huruf besar/kecil.
+		--   Model : diterima hanya jika namanya memuat NameKeyword DAN punya part "Handle"
+		--           (supaya properti peta seperti "Fruit Stand" tidak ikut).
+		SearchRoots = { Workspace },
+		HandleName = "Handle",
+		NameKeyword = "fruit",
+		RejectPrefixes = { "Meshes/" }, -- geometri peta "Meshes/bloxfruits_..."
+
+		-- Daftar buah, dicek 22 Nov 2026 terhadap sumber sekunder (progameguides, games.gg,
+		-- bloxguidesgg, bloxfruits.gg/updates). Wiki resmi tidak bisa dibuka dari sini, dan sumber-sumber
+		-- itu tidak sepenuhnya sama (ada yang menyebut 42, ada yang 44 buah). Karena itu alias lama
+		-- ikut dipakai: nama internal di game bisa saja masih nama lama.
+		-- Update 30 (5 Sep 2026) menambah Magnet. Rename: Leopard>Tiger, Rumble>Lightning,
+		-- Barrier>Creation, Falcon>Eagle, Paw>Pain, Chop>Blade, Soul>Spirit, Door>Portal.
+		KnownNames = {
+			"Rocket", "Spin", "Blade", "Spring", "Bomb", "Smoke", "Spike", "Flame", "Eagle", "Ice",
+			"Sand", "Dark", "Diamond", "Light", "Rubber", "Ghost", "Magma", "Quake", "Buddha", "Love",
+			"Creation", "Spider", "Sound", "Phoenix", "Portal", "Lightning", "Pain", "Blizzard", "Gravity",
+			"Mammoth", "T-Rex", "Dough", "Shadow", "Venom", "Control", "Spirit", "Dragon", "Tiger",
+			"Kitsune", "Yeti", "Gas", "Magnet",
+		},
+		LegacyAliases = {
+			"Kilo", "Chop", "Falcon", "Barrier", "Rumble", "Paw", "Leopard", "Soul", "Door", "Revive",
+		},
+		ExtraNames = {}, -- tambah nama buah baru di sini kalau ada update berikutnya
+
+		PendingSeconds = 60, -- Tool cocok tapi belum ada part: dicoba ulang selama ini
+		WatchSeconds = 30, -- Tool yang belum cocok dipantau perubahan namanya selama ini
+		FastScanInterval = 1, -- detik, scan anak langsung root
+		DeepScanInterval = 8, -- detik, scan semua keturunan
+		ScanChunk = 1500, -- yield tiap sekian instance saat deep scan
+	},
+
+	DespawnSeconds = nil, -- UNKNOWN: fruit lifetime on this build. nil = no countdown shown.
+	StudToMeter = 0.28, -- Roblox convention (1 stud = 0.28 m)
+	MaxCoord = 1e6, -- plausibility bound for any world position
+	UpdateInterval = 0.2,
+
+	Fly = {
+		Speed = 150, -- UNCALIBRATED studs/s, tune in-game
+		SpeedMin = 25,
+		SpeedMax = 500,
+		SpeedStep = 25,
+		ArriveOffset = Vector3.new(0, 0, 0),
+		HoldSeconds = 1.5, -- stay on the fruit this long after arrival
+		RetryAfter = 30, -- auto-fly skips a fruit this long if it is still there after hold
+		TimeoutPadding = 8,
+		MaxDt = 0.1,
+	},
+
+	Teleport = {
+		-- Teleport instan ke posisi buah: satu kali set CFrame, tanpa terbang.
+		-- UNKNOWN: apakah server Blox Fruits menerima lompatan posisi sejauh ini atau menariknya balik.
+		-- Karena itu hasilnya diverifikasi (Verify*) dan statusnya dilaporkan jujur, bukan diasumsikan berhasil.
+		Offset = Vector3.new(0, 0, 0), -- geser dari posisi Handle (mis. Vector3.new(0, 3, 0) kalau tertanam di tanah)
+		PinSeconds = 0.25, -- UNCALIBRATED: set ulang CFrame tiap frame selama ini agar posisi sempat menetap
+		VerifyWait = 0.6, -- detik setelah pin selesai sebelum posisi dicek
+		VerifyRadius = 25, -- studs: lebih jauh dari ini dari target = dianggap ditarik balik/ditolak
+		TouchAfter = true, -- ASSUMPTION: firetouchinterest ke Handle setelah tiba, membantu memicu pickup
+		HoldSeconds = 1.0, -- tunggu buah hilang dari dunia setelah tiba
+		RetryAfter = 15, -- Auto-TP melewati buah yang masih ada setelah hold selama ini
+		AutoInterval = 0.5, -- jeda minimum antar percobaan Auto-TP
+	},
+
+	Grab = {
+		-- Ambil jarak jauh (State.autoGrab). Urutan: 1) firetouchinterest dari karakter ke Handle,
+		-- 2) kalau buah belum berpindah, snap sesaat ke posisi buah lalu balik ke posisi semula.
+		-- UNKNOWN: apakah server menerima sentuhan jarak jauh di build ini -- cek lewat status/console.
+		Interval = 0.3,
+		TouchWait = 0.8, -- detik menunggu buah hilang dari dunia setelah touch
+		SnapFallback = true,
+		SnapWait = 1.2, -- detik bertahan di posisi buah pada mode snap
+		ReturnHome = true, -- balik ke posisi semula setelah snap
+		RetryAfter = 5, -- lewati buah yang gagal diambil selama ini
+		Equip = true, -- pegang buah di tangan setelah terambil
+		EquipWait = 1.5,
+	},
+
+	Colors = {
+		Panel = Color3.fromRGB(24, 24, 32),
+		Row = Color3.fromRGB(38, 38, 50),
+		Button = Color3.fromRGB(52, 52, 70),
+		Accent = Color3.fromRGB(190, 90, 220),
+		Text = Color3.fromRGB(240, 240, 245),
+		FruitName = Color3.fromRGB(255, 220, 90),
+		FruitFill = Color3.fromRGB(255, 200, 60),
+	},
+}
+
+----------------------------------------------------------------------
+-- Pure helpers (no game access, checkable offline)
+----------------------------------------------------------------------
+local Util = {}
+
+function Util.isFinite(n)
+	return type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge
+end
+
+function Util.isPlausiblePosition(p, maxCoord)
+	return Util.isFinite(p.X) and Util.isFinite(p.Y) and Util.isFinite(p.Z)
+		and math.abs(p.X) <= maxCoord and math.abs(p.Y) <= maxCoord and math.abs(p.Z) <= maxCoord
+end
+
+function Util.trim(s)
+	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+function Util.normalize(name)
+	local s = string.lower(name)
+	s = s:gsub("[^%a]+", " ")
+	s = Util.trim(s)
+	return " " .. s .. " "
+end
+
+function Util.buildTokens(...)
+	local out, seen = {}, {}
+	for _, list in ipairs({ ... }) do
+		for _, n in ipairs(list) do
+			local t = Util.normalize(n)
+			if #t > 2 and not seen[t] then
+				seen[t] = true
+				table.insert(out, t)
+			end
+		end
+	end
+	return out
+end
+
+function Util.hasRejectPrefix(name, prefixes)
+	if prefixes then
+		for _, prefix in ipairs(prefixes) do
+			if name:sub(1, #prefix) == prefix then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function Util.matchesAny(normName, tokens)
+	for _, t in ipairs(tokens) do
+		if string.find(normName, t, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+function Util.formatDistance(studs, unit, studToMeter)
+	if unit == "m" then
+		return string.format("%d m", math.floor(studs * studToMeter + 0.5))
+	end
+	return string.format("%d studs", math.floor(studs + 0.5))
+end
+
+function Util.formatAge(seconds)
+	seconds = math.max(0, math.floor(seconds))
+	if seconds < 60 then
+		return string.format("%ds", seconds)
+	elseif seconds < 3600 then
+		return string.format("%dm %02ds", seconds // 60, seconds % 60)
+	end
+	return string.format("%dh %02dm", seconds // 3600, (seconds % 3600) // 60)
+end
+
+function Util.stepToward(current, target, speed, dt)
+	local delta = target - current
+	local dist = delta.Magnitude
+	local step = speed * dt
+	if dist <= step then
+		return target, true
+	end
+	return current + delta.Unit * step, false
+end
+
+----------------------------------------------------------------------
+-- Single instance guard + environment
+----------------------------------------------------------------------
+local env = (getgenv and getgenv()) or _G
+if env.__FruitFinder and type(env.__FruitFinder.Cleanup) == "function" then
+	pcall(env.__FruitFinder.Cleanup)
+end
+
+local function guiContainer()
+	local ok, hidden = pcall(function()
+		return gethui and gethui()
+	end)
+	if ok and typeof(hidden) == "Instance" then
+		return hidden
+	end
+	local okCore = pcall(function()
+		return CoreGui.Name
+	end)
+	if okCore then
+		return CoreGui
+	end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local alive = true
+local connections = {}
+local function connect(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(connections, c)
+	return c
+end
+
+local State = {
+	espEnabled = true,
+	autoFly = false,
+	autoGrab = false,
+	autoTeleport = false,
+	notify = true,
+	unit = "studs",
+	speed = Config.Fly.Speed,
+	statusMsg = "siap",
+}
+
+local Tracked = {} -- [Instance] = record
+local Blacklist = {} -- [Instance] = expiry (os.clock)
+local Seen = setmetatable({}, { __mode = "k" }) -- notification dedupe
+local Pending = {} -- [Instance] = expiry (os.clock); nama cocok tapi part belum ada
+local Watching = setmetatable({}, { __mode = "k" }) -- [Tool] = RBXScriptConnection (pantau Name)
+local rows = {} -- [record] = { frame, label, conn }
+
+local container = guiContainer()
+local espFolder = Instance.new("Folder")
+espFolder.Name = "FF_ESP"
+espFolder.Parent = container
+
+local menuGui = Instance.new("ScreenGui")
+menuGui.Name = "FF_Menu"
+menuGui.ResetOnSpawn = false
+menuGui.DisplayOrder = 100
+menuGui.Parent = container
+
+local statusLabel, listFrame, emptyLabel
+local setStatus, refreshControls, startFlight, stopFlight, trackFruit, untrack, removeRow
+local teleportToFruit, autoTeleportTick
+
+----------------------------------------------------------------------
+-- Character / world helpers
+----------------------------------------------------------------------
+local function getHumanoid()
+	local char = LocalPlayer.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot()
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		return root
+	end
+	return nil
+end
+
+local function originPosition()
+	local root = getRoot()
+	if root then
+		return root.Position
+	end
+	local cam = Workspace.CurrentCamera
+	return cam and cam.CFrame.Position or nil
+end
+
+----------------------------------------------------------------------
+-- Detection
+----------------------------------------------------------------------
+local FruitTokens = Util.buildTokens(Config.Fruit.KnownNames, Config.Fruit.LegacyAliases, Config.Fruit.ExtraNames)
+
+local function inSearchRoot(inst)
+	for _, root in ipairs(Config.Fruit.SearchRoots) do
+		if inst:IsDescendantOf(root) then
+			return true
+		end
+	end
+	return false
+end
+
+-- true jika inst berada di dalam Model berisi Humanoid (pemain / NPC)
+local function insideCharacter(inst)
+	local p = inst.Parent
+	while p and p ~= game do
+		if p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") then
+			return true
+		end
+		p = p.Parent
+	end
+	return false
+end
+
+local function findHandle(inst, allowAnyPart)
+	local h = inst:FindFirstChild(Config.Fruit.HandleName)
+	if h and h:IsA("BasePart") then
+		return h
+	end
+	if allowAnyPart then
+		return inst:FindFirstChildWhichIsA("BasePart", true)
+	end
+	return nil
+end
+
+local function nameAccepted(inst)
+	local name = inst.Name
+	if Util.hasRejectPrefix(name, Config.Fruit.RejectPrefixes) then
+		return false
+	end
+	local norm = Util.normalize(name)
+	local hasKeyword = string.find(norm, Config.Fruit.NameKeyword, 1, true) ~= nil
+	if inst:IsA("Tool") then
+		return hasKeyword or Util.matchesAny(norm, FruitTokens)
+	end
+	return hasKeyword
+end
+
+-- returns "ok", handle | "wait" | "reject"
+local function evaluate(inst)
+	local isTool = inst:IsA("Tool")
+	if not isTool and not inst:IsA("Model") then
+		return "reject"
+	end
+	if not nameAccepted(inst) then
+		return "reject"
+	end
+	if not isTool and inst:FindFirstChildOfClass("Humanoid") then
+		return "reject"
+	end
+	if not inSearchRoot(inst) or insideCharacter(inst) then
+		return "reject"
+	end
+	local handle = findHandle(inst, isTool)
+	if not handle then
+		return isTool and "wait" or "reject"
+	end
+	return "ok", handle
+end
+
+-- Nama generik ("Fruit ") -> coba ambil nama buah dari keturunannya.
+-- ASSUMPTION (belum diverifikasi): nama buah bisa muncul sebagai nama child.
+local function displayName(inst)
+	local name = Util.trim(inst.Name)
+	local norm = Util.normalize(name)
+	if norm == " fruit " or norm == " fruits " then
+		for _, d in ipairs(inst:GetDescendants()) do
+			if Util.matchesAny(Util.normalize(d.Name), FruitTokens) then
+				return Util.trim(d.Name) .. " (Fruit)"
+			end
+		end
+	end
+	if name == "" then
+		return "Fruit"
+	end
+	return name
+end
+
+local function consider(inst, preexisting)
+	if Tracked[inst] then
+		return
+	end
+	if not (inst:IsA("Tool") or inst:IsA("Model")) then
+		return
+	end
+	local ok, status, handle = pcall(evaluate, inst)
+	if not ok then
+		return
+	end
+	if status == "ok" then
+		trackFruit(inst, preexisting, handle)
+	elseif status == "wait" then
+		Pending[inst] = Pending[inst] or (os.clock() + Config.Fruit.PendingSeconds)
+	else
+		Pending[inst] = nil
+	end
+end
+
+-- Tool yang namanya belum cocok bisa diganti nama setelah di-parent: pantau sebentar.
+local function watchTool(inst)
+	if Watching[inst] then
+		return
+	end
+	local c = inst:GetPropertyChangedSignal("Name"):Connect(function()
+		consider(inst, false)
+	end)
+	Watching[inst] = c
+	task.delay(Config.Fruit.WatchSeconds, function()
+		if Watching[inst] == c then
+			Watching[inst] = nil
+		end
+		c:Disconnect()
+	end)
+end
+
+local function onDescendantAdded(inst)
+	if not alive then
+		return
+	end
+	local isTool = inst:IsA("Tool")
+	if not (isTool or inst:IsA("Model")) then
+		return
+	end
+	consider(inst, false)
+	if isTool and not Tracked[inst] and not Pending[inst] then
+		watchTool(inst)
+	end
+end
+
+
+setStatus = function(msg)
+	if msg then
+		State.statusMsg = msg
+	end
+	if statusLabel and statusLabel.Parent then
+		local count = 0
+		for _ in pairs(Tracked) do
+			count += 1
+		end
+		statusLabel.Text = string.format("%s | buah: %d | speed %d", State.statusMsg, count, State.speed)
+	end
+end
+
+local function describe(rec)
+	local age = os.clock() - rec.firstSeenClock
+	local timeTxt
+	if rec.preexisting then
+		timeTxt = "sudah ada >= " .. Util.formatAge(age) .. " (spawn asli tak diketahui)"
+	else
+		timeTxt = "muncul " .. Util.formatAge(age) .. " lalu (" .. os.date("%H:%M:%S", rec.firstSeenWall) .. ")"
+		if Config.DespawnSeconds then
+			timeTxt = timeTxt .. " | sisa ~" .. Util.formatAge(math.max(0, Config.DespawnSeconds - age))
+		end
+	end
+	return Util.formatDistance(rec.dist or 0, State.unit, Config.StudToMeter), timeTxt
+end
+
+----------------------------------------------------------------------
+-- ESP
+----------------------------------------------------------------------
+local function buildEsp(rec)
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "FF_Label"
+	bb.Adornee = rec.handle
+	bb.AlwaysOnTop = true
+	bb.LightInfluence = 0
+	bb.MaxDistance = math.huge
+	bb.Size = UDim2.fromOffset(270, 40)
+	bb.StudsOffset = Vector3.new(0, 3, 0)
+	bb.Enabled = State.espEnabled
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Size = UDim2.new(1, 0, 0.55, 0)
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.TextSize = 15
+	nameLabel.TextColor3 = Config.Colors.FruitName
+	nameLabel.TextStrokeTransparency = 0.3
+	nameLabel.Text = rec.name
+	nameLabel.Parent = bb
+
+	local infoLabel = Instance.new("TextLabel")
+	infoLabel.BackgroundTransparency = 1
+	infoLabel.Position = UDim2.fromScale(0, 0.55)
+	infoLabel.Size = UDim2.new(1, 0, 0.45, 0)
+	infoLabel.Font = Enum.Font.Gotham
+	infoLabel.TextSize = 11
+	infoLabel.TextColor3 = Config.Colors.Text
+	infoLabel.TextStrokeTransparency = 0.4
+	infoLabel.Text = ""
+	infoLabel.Parent = bb
+	bb.Parent = espFolder
+
+	local hl = Instance.new("Highlight")
+	hl.Adornee = rec.handle
+	hl.FillColor = Config.Colors.FruitFill
+	hl.OutlineColor = Color3.new(1, 1, 1)
+	hl.FillTransparency = 0.55
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Enabled = State.espEnabled
+	hl.Parent = espFolder
+
+	rec.esp = { bb = bb, nameLabel = nameLabel, infoLabel = infoLabel, hl = hl }
+end
+
+----------------------------------------------------------------------
+-- Tracking
+----------------------------------------------------------------------
+local function notifyFound(rec)
+	if not State.notify or Seen[rec.inst] then
+		return
+	end
+	Seen[rec.inst] = true
+	local origin = originPosition()
+	local distTxt = ""
+	if origin then
+		distTxt = " (" .. Util.formatDistance((rec.handle.Position - origin).Magnitude, State.unit, Config.StudToMeter) .. ")"
+	end
+	pcall(function()
+		StarterGui:SetCore("SendNotification", {
+			Title = "Fruit Finder",
+			Text = rec.name .. distTxt,
+			Duration = 5,
+		})
+	end)
+end
+
+trackFruit = function(inst, preexisting, handle)
+	if not alive or Tracked[inst] then
+		return
+	end
+	local rec = {
+		inst = inst,
+		handle = handle,
+		name = displayName(inst),
+		firstSeenClock = os.clock(),
+		firstSeenWall = os.time(),
+		preexisting = preexisting,
+	}
+	Tracked[inst] = rec
+	Pending[inst] = nil
+	buildEsp(rec)
+	notifyFound(rec)
+	setStatus()
+end
+
+untrack = function(inst)
+	local rec = Tracked[inst]
+	if not rec then
+		return
+	end
+	Tracked[inst] = nil
+	if rec.conn then
+		rec.conn:Disconnect()
+	end
+	if rec.esp then
+		rec.esp.bb:Destroy()
+		rec.esp.hl:Destroy()
+	end
+	removeRow(rec)
+	Blacklist[inst] = nil
+	setStatus()
+end
+
+----------------------------------------------------------------------
+-- Flight
+----------------------------------------------------------------------
+local Flight = { active = false }
+local savedCollide = {}
+
+local function setNoclip(char)
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") then
+			if savedCollide[part] == nil then
+				savedCollide[part] = part.CanCollide
+			end
+			part.CanCollide = false
+		end
+	end
+end
+
+local function restoreCollide()
+	for part, was in pairs(savedCollide) do
+		if part.Parent then
+			part.CanCollide = was
+		end
+		savedCollide[part] = nil
+	end
+end
+
+stopFlight = function(reason)
+	if not Flight.active then
+		return
+	end
+	Flight.active = false
+	if Flight.conn then
+		Flight.conn:Disconnect()
+		Flight.conn = nil
+	end
+	if Flight.stepConn then
+		Flight.stepConn:Disconnect()
+		Flight.stepConn = nil
+	end
+	restoreCollide()
+	local root = getRoot()
+	if root then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+	Flight.target = nil
+	setStatus(reason or "berhenti")
+end
+
+local function noclipStep()
+	local char = LocalPlayer.Character
+	if char then
+		setNoclip(char)
+	end
+end
+
+local function flightStep(dt)
+	local rec = Flight.target
+	local root = getRoot()
+	local hum = getHumanoid()
+	if not root or not hum or hum.Health <= 0 then
+		return stopFlight("karakter tidak tersedia")
+	end
+	if not rec or Tracked[rec.inst] ~= rec then
+		if Flight.arrivedAt then
+			return stopFlight("tiba, buah sudah hilang dari dunia (kemungkinan terambil)")
+		end
+		return stopFlight("buah hilang sebelum tiba")
+	end
+	local goal = rec.handle.Position + Config.Fly.ArriveOffset
+	if not Util.isPlausiblePosition(goal, Config.MaxCoord) then
+		return stopFlight("posisi target tidak valid")
+	end
+	if os.clock() > Flight.deadline then
+		return stopFlight("timeout")
+	end
+
+	dt = math.min(dt, Config.Fly.MaxDt)
+	local nextPos, arrived = Util.stepToward(root.Position, goal, State.speed, dt)
+	root.CFrame = CFrame.new(nextPos) * root.CFrame.Rotation
+	root.AssemblyLinearVelocity = Vector3.zero
+
+	if arrived then
+		Flight.arrivedAt = Flight.arrivedAt or os.clock()
+		if os.clock() - Flight.arrivedAt >= Config.Fly.HoldSeconds then
+			Blacklist[rec.inst] = os.clock() + Config.Fly.RetryAfter
+			stopFlight("tiba, buah masih ada; auto-fly lewati " .. Config.Fly.RetryAfter .. "s")
+		end
+	end
+end
+
+startFlight = function(rec)
+	if not alive then
+		return
+	end
+	local root, hum = getRoot(), getHumanoid()
+	if not root or not hum or hum.Health <= 0 then
+		setStatus("karakter belum siap")
+		return
+	end
+	if Tracked[rec.inst] ~= rec then
+		setStatus("buah sudah tidak ada")
+		return
+	end
+	if Flight.active then
+		stopFlight("ganti target")
+	end
+	local dist = (rec.handle.Position - root.Position).Magnitude
+	Flight.active = true
+	Flight.target = rec
+	Flight.arrivedAt = nil
+	Flight.deadline = os.clock() + (dist / State.speed) * 2 + Config.Fly.TimeoutPadding
+	Flight.stepConn = RunService.Stepped:Connect(noclipStep)
+	Flight.conn = RunService.Heartbeat:Connect(flightStep)
+	setStatus("terbang ke " .. rec.name)
+end
+
+local function nearestFruit(respectBlacklist)
+	local origin = originPosition()
+	if not origin then
+		return nil
+	end
+	local now = os.clock()
+	local best, bestDist
+	for inst, rec in pairs(Tracked) do
+		local pos = rec.handle.Position
+		local blocked = respectBlacklist and Blacklist[inst] and Blacklist[inst] > now
+		if not blocked and Util.isPlausiblePosition(pos, Config.MaxCoord) then
+			local d = (pos - origin).Magnitude
+			if not bestDist or d < bestDist then
+				best, bestDist = rec, d
+			end
+		end
+	end
+	return best
+end
+
+----------------------------------------------------------------------
+-- Grab (ambil jarak jauh)
+----------------------------------------------------------------------
+local GrabCooldown = setmetatable({}, { __mode = "k" }) -- [Instance] = os.clock() sampai kapan dilewati
+local Grabbing = false
+local Teleporting = false -- true selama satu teleport berjalan (pin + verifikasi + hold)
+
+local function fruitTaken(inst)
+	return not inSearchRoot(inst) or insideCharacter(inst)
+end
+
+local function waitTaken(inst, seconds)
+	local deadline = os.clock() + seconds
+	while os.clock() < deadline do
+		if fruitTaken(inst) then
+			return true
+		end
+		task.wait(0.05)
+	end
+	return fruitTaken(inst)
+end
+
+local function snapshotTools()
+	local set = {}
+	local function add(container)
+		if container then
+			for _, t in ipairs(container:GetChildren()) do
+				if t:IsA("Tool") then
+					set[t] = true
+				end
+			end
+		end
+	end
+	add(LocalPlayer.Character)
+	add(LocalPlayer:FindFirstChildOfClass("Backpack"))
+	return set
+end
+
+local function findNewTool(before)
+	local function scan(container)
+		if container then
+			for _, t in ipairs(container:GetChildren()) do
+				if t:IsA("Tool") and not before[t] then
+					return t
+				end
+			end
+		end
+		return nil
+	end
+	return scan(LocalPlayer.Character) or scan(LocalPlayer:FindFirstChildOfClass("Backpack"))
+end
+
+local function touchGrab(root, handle)
+	local fn = (getgenv and getgenv().firetouchinterest) or firetouchinterest
+	if type(fn) ~= "function" then
+		return false
+	end
+	return (pcall(function()
+		fn(root, handle, 0)
+		task.wait()
+		fn(root, handle, 1)
+	end))
+end
+
+local function snapGrab(root, handle, inst)
+	local home = root.CFrame
+	root.CFrame = CFrame.new(handle.Position) * root.CFrame.Rotation
+	root.AssemblyLinearVelocity = Vector3.zero
+	local taken = waitTaken(inst, Config.Grab.SnapWait)
+	if Config.Grab.ReturnHome and root.Parent then
+		root.CFrame = home
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+	return taken
+end
+
+local function grabOne(rec)
+	local inst = rec.inst
+	local root, hum = getRoot(), getHumanoid()
+	if not root or not hum or hum.Health <= 0 then
+		return
+	end
+	if not Util.isPlausiblePosition(rec.handle.Position, Config.MaxCoord) then
+		GrabCooldown[inst] = os.clock() + Config.Grab.RetryAfter
+		return
+	end
+	local before = snapshotTools()
+	setStatus("ambil " .. rec.name)
+	local taken, method = false, "touch"
+	if touchGrab(root, rec.handle) then
+		taken = waitTaken(inst, Config.Grab.TouchWait)
+	end
+	if not taken and Config.Grab.SnapFallback and Tracked[inst] == rec then
+		method = "snap"
+		taken = snapGrab(root, rec.handle, inst)
+	end
+	if not taken then
+		GrabCooldown[inst] = os.clock() + Config.Grab.RetryAfter
+		setStatus("gagal ambil " .. rec.name .. " (coba lagi " .. Config.Grab.RetryAfter .. "s)")
+		return
+	end
+	if Config.Grab.Equip then
+		local tool
+		local deadline = os.clock() + Config.Grab.EquipWait
+		repeat
+			tool = findNewTool(before)
+			if not tool then
+				task.wait(0.05)
+			end
+		until tool or os.clock() > deadline
+		if tool and tool.Parent ~= LocalPlayer.Character then
+			pcall(function()
+				hum:EquipTool(tool)
+			end)
+		end
+		setStatus(string.format("terambil (%s): %s%s", method, rec.name, tool and "" or " | tool tidak ditemukan di tas"))
+	else
+		setStatus(string.format("terambil (%s): %s", method, rec.name))
+	end
+end
+
+local function grabLoop()
+	while alive do
+		task.wait(Config.Grab.Interval)
+		if State.autoGrab and not Grabbing and not Teleporting and not Flight.active then
+			local origin = originPosition()
+			local now = os.clock()
+			local target, bestDist
+			if origin then
+				for inst, rec in pairs(Tracked) do
+					if not (GrabCooldown[inst] and GrabCooldown[inst] > now) then
+						local pos = rec.handle.Position
+						if Util.isPlausiblePosition(pos, Config.MaxCoord) then
+							local d = (pos - origin).Magnitude
+							if not bestDist or d < bestDist then
+								target, bestDist = rec, d
+							end
+						end
+					end
+				end
+			end
+			if target then
+				Grabbing = true
+				local ok, err = pcall(grabOne, target)
+				Grabbing = false
+				if not ok then
+					GrabCooldown[target.inst] = os.clock() + Config.Grab.RetryAfter
+					warn("[FruitFinder] grab error:", err)
+				end
+			end
+		end
+	end
+end
+
+local function grabManual(rec)
+	if not alive or Grabbing or Teleporting then
+		setStatus("grab/teleport sedang berjalan")
+		return
+	end
+	if Tracked[rec.inst] ~= rec then
+		setStatus("buah sudah tidak ada")
+		return
+	end
+	task.spawn(function()
+		Grabbing = true
+		local ok, err = pcall(grabOne, rec)
+		Grabbing = false
+		if not ok then
+			GrabCooldown[rec.inst] = os.clock() + Config.Grab.RetryAfter
+			warn("[FruitFinder] grab error:", err)
+		end
+	end)
+end
+
+----------------------------------------------------------------------
+-- Teleport (instan, tanpa terbang)
+----------------------------------------------------------------------
+local TeleportCooldown = setmetatable({}, { __mode = "k" }) -- [Instance] = os.clock() sampai kapan dilewati
+local lastAutoTeleport = 0
+
+local function equipNewTool(before)
+	local tool
+	local deadline = os.clock() + Config.Grab.EquipWait
+	repeat
+		tool = findNewTool(before)
+		if not tool then
+			task.wait(0.05)
+		end
+	until tool or os.clock() > deadline or not alive
+	local hum = getHumanoid()
+	if tool and hum and tool.Parent ~= LocalPlayer.Character then
+		pcall(function()
+			hum:EquipTool(tool)
+		end)
+	end
+	return tool
+end
+
+-- Satu lompatan CFrame ke posisi Handle, pin beberapa frame, lalu verifikasi hasilnya.
+local function teleportRun(rec)
+	local cfg = Config.Teleport
+	local inst = rec.inst
+	local root, hum = getRoot(), getHumanoid()
+	if not root or not hum or hum.Health <= 0 then
+		setStatus("karakter belum siap")
+		return
+	end
+
+	local function currentGoal()
+		if Tracked[inst] == rec and rec.handle.Parent then
+			local p = rec.handle.Position + cfg.Offset
+			if Util.isPlausiblePosition(p, Config.MaxCoord) then
+				return p
+			end
+		end
+		return nil
+	end
+
+	local goal = currentGoal()
+	if not goal then
+		TeleportCooldown[inst] = os.clock() + cfg.RetryAfter
+		setStatus("posisi target tidak valid atau buah sudah hilang")
+		return
+	end
+
+	if Flight.active then
+		stopFlight("ganti ke teleport")
+	end
+	local before = snapshotTools()
+	setStatus("teleport ke " .. rec.name)
+
+	local pinUntil = os.clock() + cfg.PinSeconds
+	repeat
+		local r = getRoot()
+		if not r then
+			setStatus("karakter hilang saat teleport")
+			return
+		end
+		goal = currentGoal() or goal
+		r.CFrame = CFrame.new(goal) * r.CFrame.Rotation
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+		RunService.Heartbeat:Wait()
+	until os.clock() >= pinUntil or not alive
+	if not alive then
+		return
+	end
+
+	root = getRoot()
+	if not root then
+		setStatus("karakter hilang saat teleport")
+		return
+	end
+	if cfg.TouchAfter then
+		touchGrab(root, rec.handle)
+	end
+
+	if waitTaken(inst, cfg.HoldSeconds) then
+		local tool
+		if Config.Grab.Equip then
+			tool = equipNewTool(before)
+		else
+			tool = findNewTool(before)
+		end
+		if tool then
+			setStatus("terambil (teleport): " .. rec.name)
+		else
+			setStatus("buah " .. rec.name .. " hilang dari dunia, tapi tool baru tidak ditemukan (bisa diambil pemain lain)")
+		end
+		return
+	end
+
+	task.wait(cfg.VerifyWait)
+	root = getRoot()
+	if not root then
+		return
+	end
+	TeleportCooldown[inst] = os.clock() + cfg.RetryAfter
+	local off = (root.Position - goal).Magnitude
+	if off > cfg.VerifyRadius then
+		setStatus(string.format("teleport ke %s kemungkinan ditolak/ditarik balik server (%d studs dari buah)", rec.name, math.floor(off + 0.5)))
+	else
+		setStatus(string.format("tiba di %s tapi buah masih ada; Auto-TP lewati %ds", rec.name, cfg.RetryAfter))
+	end
+end
+
+teleportToFruit = function(rec)
+	if not alive then
+		return
+	end
+	if Teleporting or Grabbing then
+		setStatus("grab/teleport sedang berjalan")
+		return
+	end
+	if Tracked[rec.inst] ~= rec then
+		setStatus("buah sudah tidak ada")
+		return
+	end
+	Teleporting = true
+	task.spawn(function()
+		local ok, err = pcall(teleportRun, rec)
+		Teleporting = false
+		if not ok then
+			TeleportCooldown[rec.inst] = os.clock() + Config.Teleport.RetryAfter
+			warn("[FruitFinder] teleport error:", err)
+			setStatus("teleport error (lihat console)")
+		end
+	end)
+end
+
+local function nearestTeleportTarget()
+	local origin = originPosition()
+	if not origin then
+		return nil
+	end
+	local now = os.clock()
+	local best, bestDist
+	for inst, rec in pairs(Tracked) do
+		local pos = rec.handle.Position
+		local blocked = TeleportCooldown[inst] and TeleportCooldown[inst] > now
+		if not blocked and Util.isPlausiblePosition(pos, Config.MaxCoord) then
+			local d = (pos - origin).Magnitude
+			if not bestDist or d < bestDist then
+				best, bestDist = rec, d
+			end
+		end
+	end
+	return best
+end
+
+autoTeleportTick = function()
+	if not State.autoTeleport or Teleporting or Grabbing or Flight.active then
+		return
+	end
+	local now = os.clock()
+	if now - lastAutoTeleport < Config.Teleport.AutoInterval then
+		return
+	end
+	local rec = nearestTeleportTarget()
+	if rec then
+		lastAutoTeleport = now
+		teleportToFruit(rec)
+	end
+end
+
+----------------------------------------------------------------------
+-- Menu
+----------------------------------------------------------------------
+local function make(class, props, parent)
+	local obj = Instance.new(class)
+	for k, v in pairs(props) do
+		obj[k] = v
+	end
+	obj.Parent = parent
+	return obj
+end
+
+local frame = make("Frame", {
+	Name = "Panel",
+	BackgroundColor3 = Config.Colors.Panel,
+	BorderSizePixel = 0,
+	Position = UDim2.fromOffset(10, 60),
+	Size = UDim2.fromOffset(360, 360),
+	ClipsDescendants = true,
+}, menuGui)
+make("UICorner", { CornerRadius = UDim.new(0, 10) }, frame)
+
+local titleBar = make("Frame", {
+	BackgroundColor3 = Config.Colors.Accent,
+	BorderSizePixel = 0,
+	Size = UDim2.new(1, 0, 0, 28),
+}, frame)
+make("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(8, 0),
+	Size = UDim2.new(1, -70, 1, 0),
+	Font = Enum.Font.GothamBold,
+	TextSize = 13,
+	TextColor3 = Config.Colors.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "Fruit Finder",
+}, titleBar)
+
+local body = make("Frame", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(0, 28),
+	Size = UDim2.new(1, 0, 1, -28),
+}, frame)
+
+local function titleButton(text, xOffset, onClick)
+	local b = make("TextButton", {
+		Text = text,
+		Font = Enum.Font.GothamBold,
+		TextSize = 14,
+		TextColor3 = Config.Colors.Text,
+		BackgroundTransparency = 1,
+		Position = UDim2.new(1, xOffset, 0, 0),
+		Size = UDim2.fromOffset(32, 28),
+	}, titleBar)
+	connect(b.Activated, onClick)
+	return b
+end
+
+local minimized = false
+titleButton("-", -64, function()
+	minimized = not minimized
+	body.Visible = not minimized
+	frame.Size = minimized and UDim2.fromOffset(360, 28) or UDim2.fromOffset(360, 360)
+end)
+
+local Cleanup -- forward
+titleButton("X", -32, function()
+	Cleanup()
+end)
+
+-- dragging (mouse and touch)
+local dragging, dragStart, startPos = false, nil, nil
+connect(titleBar.InputBegan, function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = frame.Position
+		local c
+		c = input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+				c:Disconnect()
+			end
+		end)
+	end
+end)
+connect(UserInputService.InputChanged, function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local d = input.Position - dragStart
+		frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end)
+
+-- controls grid
+local controls = make("Frame", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(6, 4),
+	Size = UDim2.new(1, -12, 0, 132),
+}, body)
+make("UIGridLayout", {
+	CellSize = UDim2.new(1 / 3, -4, 0, 30),
+	CellPadding = UDim2.fromOffset(4, 4),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}, controls)
+
+local function makeButton(text, order, onClick)
+	local b = make("TextButton", {
+		Text = text,
+		LayoutOrder = order,
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		TextColor3 = Config.Colors.Text,
+		BackgroundColor3 = Config.Colors.Button,
+		BorderSizePixel = 0,
+	}, controls)
+	make("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+	connect(b.Activated, onClick)
+	return b
+end
+
+local btnEsp = makeButton("", 1, function()
+	State.espEnabled = not State.espEnabled
+	refreshControls()
+end)
+local btnAuto = makeButton("", 2, function()
+	State.autoFly = not State.autoFly
+	if State.autoFly then
+		State.autoTeleport = false
+	end
+	refreshControls()
+end)
+local btnNotify = makeButton("", 3, function()
+	State.notify = not State.notify
+	refreshControls()
+end)
+local btnUnit = makeButton("", 4, function()
+	State.unit = (State.unit == "studs") and "m" or "studs"
+	refreshControls()
+end)
+makeButton("Speed -", 5, function()
+	State.speed = math.max(Config.Fly.SpeedMin, State.speed - Config.Fly.SpeedStep)
+	setStatus()
+end)
+makeButton("Speed +", 6, function()
+	State.speed = math.min(Config.Fly.SpeedMax, State.speed + Config.Fly.SpeedStep)
+	setStatus()
+end)
+makeButton("Stop", 7, function()
+	stopFlight("dihentikan manual")
+	State.autoFly = false
+	State.autoTeleport = false
+	refreshControls()
+end)
+makeButton("Terdekat", 8, function()
+	local rec = nearestFruit(false)
+	if rec then
+		startFlight(rec)
+	else
+		setStatus("belum ada buah terdeteksi")
+	end
+end)
+
+local function probe()
+	print("[FruitFinder] StreamingEnabled =", Workspace.StreamingEnabled)
+	local total, matched, tracked = 0, 0, 0
+	for _, inst in ipairs(Workspace:GetDescendants()) do
+		if inst:IsA("Tool") and not insideCharacter(inst) then
+			total += 1
+			local status = evaluate(inst)
+			if status == "ok" then
+				matched += 1
+			end
+			if Tracked[inst] then
+				tracked += 1
+			end
+			if total <= 100 then
+				print(string.format("[FruitFinder] Tool %s | status=%s | tracked=%s", inst:GetFullName(), status, tostring(Tracked[inst] ~= nil)))
+			end
+		end
+	end
+	setStatus(string.format("probe: %d Tool dunia, %d cocok, %d terlacak (lihat console)", total, matched, tracked))
+end
+makeButton("Probe", 9, probe)
+local btnGrab = makeButton("", 10, function()
+	State.autoGrab = not State.autoGrab
+	if State.autoGrab then
+		State.autoTeleport = false
+	end
+	refreshControls()
+end)
+makeButton("TP Terdekat", 11, function()
+	local rec = nearestFruit(false)
+	if rec then
+		teleportToFruit(rec)
+	else
+		setStatus("belum ada buah terdeteksi")
+	end
+end)
+local btnAutoTp = makeButton("", 12, function()
+	State.autoTeleport = not State.autoTeleport
+	if State.autoTeleport then
+		-- Auto-fly dan Auto-grab (mode snap) sama-sama memindahkan karakter dan akan berebut dengan teleport.
+		State.autoFly = false
+		State.autoGrab = false
+		stopFlight("beralih ke Auto-TP")
+	end
+	refreshControls()
+end)
+
+refreshControls = function()
+	btnEsp.Text = "ESP: " .. (State.espEnabled and "ON" or "OFF")
+	btnAuto.Text = "Auto-fly: " .. (State.autoFly and "ON" or "OFF")
+	btnNotify.Text = "Notif: " .. (State.notify and "ON" or "OFF")
+	btnUnit.Text = "Unit: " .. State.unit
+	btnGrab.Text = "Auto-grab: " .. (State.autoGrab and "ON" or "OFF")
+	btnAutoTp.Text = "Auto-TP: " .. (State.autoTeleport and "ON" or "OFF")
+end
+refreshControls()
+
+statusLabel = make("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(6, 140),
+	Size = UDim2.new(1, -12, 0, 32),
+	Font = Enum.Font.Gotham,
+	TextSize = 11,
+	TextColor3 = Config.Colors.Text,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	Text = "",
+}, body)
+
+listFrame = make("ScrollingFrame", {
+	BackgroundColor3 = Config.Colors.Row,
+	BackgroundTransparency = 0.5,
+	BorderSizePixel = 0,
+	Position = UDim2.fromOffset(6, 176),
+	Size = UDim2.new(1, -12, 1, -182),
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollBarThickness = 4,
+}, body)
+make("UICorner", { CornerRadius = UDim.new(0, 6) }, listFrame)
+make("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, listFrame)
+
+emptyLabel = make("TextLabel", {
+	BackgroundTransparency = 1,
+	Size = UDim2.new(1, 0, 0, 30),
+	Font = Enum.Font.Gotham,
+	TextSize = 11,
+	TextColor3 = Config.Colors.Text,
+	Text = "Belum ada buah terdeteksi",
+}, listFrame)
+
+local function createRow(rec)
+	local row = make("Frame", {
+		BackgroundColor3 = Config.Colors.Row,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, -4, 0, 36),
+	}, listFrame)
+	make("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+	local label = make("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(6, 0),
+		Size = UDim2.new(1, -178, 1, 0),
+		Font = Enum.Font.Gotham,
+		TextSize = 10,
+		TextColor3 = Config.Colors.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true,
+		Text = "",
+	}, row)
+	local flyBtn = make("TextButton", {
+		Text = "Fly",
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextColor3 = Config.Colors.Text,
+		BackgroundColor3 = Config.Colors.Accent,
+		BorderSizePixel = 0,
+		Position = UDim2.new(1, -172, 0.5, -14),
+		Size = UDim2.fromOffset(52, 28),
+	}, row)
+	make("UICorner", { CornerRadius = UDim.new(0, 6) }, flyBtn)
+	local conn = flyBtn.Activated:Connect(function()
+		if Tracked[rec.inst] == rec then
+			startFlight(rec)
+		end
+	end)
+	local tpBtn = make("TextButton", {
+		Text = "TP",
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextColor3 = Config.Colors.Text,
+		BackgroundColor3 = Config.Colors.Accent,
+		BorderSizePixel = 0,
+		Position = UDim2.new(1, -114, 0.5, -14),
+		Size = UDim2.fromOffset(52, 28),
+	}, row)
+	make("UICorner", { CornerRadius = UDim.new(0, 6) }, tpBtn)
+	local conn3 = tpBtn.Activated:Connect(function()
+		if Tracked[rec.inst] == rec then
+			teleportToFruit(rec)
+		end
+	end)
+	local grabBtn = make("TextButton", {
+		Text = "Grab",
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextColor3 = Config.Colors.Text,
+		BackgroundColor3 = Config.Colors.Button,
+		BorderSizePixel = 0,
+		Position = UDim2.new(1, -58, 0.5, -14),
+		Size = UDim2.fromOffset(52, 28),
+	}, row)
+	make("UICorner", { CornerRadius = UDim.new(0, 6) }, grabBtn)
+	local conn2 = grabBtn.Activated:Connect(function()
+		if Tracked[rec.inst] == rec then
+			grabManual(rec)
+		end
+	end)
+	rows[rec] = { frame = row, label = label, conn = conn, conn2 = conn2, conn3 = conn3 }
+end
+
+removeRow = function(rec)
+	local row = rows[rec]
+	if not row then
+		return
+	end
+	rows[rec] = nil
+	row.conn:Disconnect()
+	if row.conn2 then
+		row.conn2:Disconnect()
+	end
+	if row.conn3 then
+		row.conn3:Disconnect()
+	end
+	row.frame:Destroy()
+end
+
+----------------------------------------------------------------------
+-- Update loop
+----------------------------------------------------------------------
+local function sweep()
+	for inst, rec in pairs(Tracked) do
+		local keep = inSearchRoot(inst) and not insideCharacter(inst)
+		if keep and not rec.handle:IsDescendantOf(inst) then
+			local h = findHandle(inst, inst:IsA("Tool"))
+			if h then
+				rec.handle = h
+				rec.esp.bb.Adornee = h
+				rec.esp.hl.Adornee = h
+			else
+				keep = false
+			end
+		end
+		if not keep then
+			untrack(inst)
+		end
+	end
+	local now = os.clock()
+	for inst, expiry in pairs(Pending) do
+		if now > expiry or not inSearchRoot(inst) then
+			Pending[inst] = nil
+		else
+			consider(inst, false)
+		end
+	end
+end
+
+local function updateAll()
+	local origin = originPosition()
+	local count = 0
+	for _, rec in pairs(Tracked) do
+		local pos = rec.handle.Position
+		local valid = origin ~= nil and Util.isPlausiblePosition(pos, Config.MaxCoord)
+		rec.valid = valid
+		rec.esp.bb.Enabled = State.espEnabled and valid
+		rec.esp.hl.Enabled = State.espEnabled and valid
+		if valid then
+			count += 1
+			rec.dist = (pos - origin).Magnitude
+			local distTxt, timeTxt = describe(rec)
+			rec.esp.nameLabel.Text = rec.name .. " | " .. distTxt
+			rec.esp.infoLabel.Text = timeTxt
+			if not rows[rec] then
+				createRow(rec)
+			end
+			local row = rows[rec]
+			row.frame.LayoutOrder = math.floor(rec.dist)
+			row.label.Text = rec.name .. " | " .. distTxt .. "\n" .. timeTxt
+		else
+			removeRow(rec)
+		end
+	end
+	emptyLabel.Visible = (count == 0)
+end
+
+local function autoFlyTick()
+	if not State.autoFly or Flight.active then
+		return
+	end
+	local rec = nearestFruit(true)
+	if rec then
+		startFlight(rec)
+	end
+end
+
+local acc = 0
+connect(RunService.Heartbeat, function(dt)
+	acc += dt
+	if acc < Config.UpdateInterval then
+		return
+	end
+	acc = 0
+	local ok, err = pcall(function()
+		sweep()
+		updateAll()
+		autoFlyTick()
+		autoTeleportTick()
+	end)
+	if not ok then
+		warn("[FruitFinder] update error:", err)
+	end
+end)
+
+----------------------------------------------------------------------
+-- Cleanup + init
+----------------------------------------------------------------------
+local api = {}
+
+Cleanup = function()
+	if not alive then
+		return
+	end
+	alive = false
+	stopFlight("cleanup")
+	for _, c in ipairs(connections) do
+		c:Disconnect()
+	end
+	table.clear(connections)
+	for inst, c in pairs(Watching) do
+		c:Disconnect()
+		Watching[inst] = nil
+	end
+	table.clear(Pending)
+	for inst in pairs(Tracked) do
+		untrack(inst)
+	end
+	for rec in pairs(rows) do
+		removeRow(rec)
+	end
+	espFolder:Destroy()
+	menuGui:Destroy()
+	if env.__FruitFinder == api then
+		env.__FruitFinder = nil
+	end
+end
+
+api.Cleanup = Cleanup
+env.__FruitFinder = api
+
+local function scanLoop()
+	local cfg = Config.Fruit
+	local sinceDeep = cfg.DeepScanInterval -- pass pertama langsung deep scan
+	while alive do
+		for _, root in ipairs(cfg.SearchRoots) do
+			for _, child in ipairs(root:GetChildren()) do
+				consider(child, true)
+			end
+		end
+		sinceDeep += cfg.FastScanInterval
+		if sinceDeep >= cfg.DeepScanInterval then
+			sinceDeep = 0
+			for _, root in ipairs(cfg.SearchRoots) do
+				local list = root:GetDescendants()
+				for i = 1, #list do
+					if i % cfg.ScanChunk == 0 then
+						task.wait()
+						if not alive then
+							return
+						end
+					end
+					consider(list[i], true)
+				end
+			end
+		end
+		task.wait(cfg.FastScanInterval)
+	end
+end
+
+for _, root in ipairs(Config.Fruit.SearchRoots) do
+	connect(root.DescendantAdded, onDescendantAdded)
+end
+task.spawn(scanLoop)
+task.spawn(grabLoop)
+
+setStatus("siap")
+if Workspace.StreamingEnabled then
+	setStatus("siap | StreamingEnabled ON: buah di luar jangkauan stream tidak terlihat client")
+end
+print("[FruitFinder] loaded; StreamingEnabled =", Workspace.StreamingEnabled)
